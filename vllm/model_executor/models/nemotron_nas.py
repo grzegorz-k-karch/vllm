@@ -45,6 +45,9 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.models.llama import LlamaAttention, LlamaMLP
 from vllm.sequence import IntermediateTensors
+from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
+
+from transformers import MambaConfig as TransformersMambaConfig
 
 from .interfaces import HasNoOps, SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
@@ -107,6 +110,105 @@ class DeciLMAttention(LlamaAttention):
             partial_rotary_factor=self.partial_rotary_factor)
 
 
+class DeciLMMambaMixer(nn.Module):
+    def __init__(
+        self,
+        config: LlamaConfig,
+        block_config,
+        prefix: str = "",
+    ):
+        super().__init__()
+        # mamba_config = config.block_configs[0].attention.mamba
+        self.mamba = MambaMixer2(
+            hidden_size=config.hidden_size,
+            ssm_state_size=block_config.attention.mamba.state_dim,
+            conv_kernel_size=4,  # hardcoded from megatron_lm__mamba_mixer.py
+            intermediate_size=config.hidden_size,
+            use_conv_bias=True, #config.mamba_conv_bias,
+            use_bias=True, #config.mamba_proj_bias,
+            n_groups=block_config.attention.mamba.num_groups,
+            num_heads=block_config.attention.mamba.num_heads,
+            head_dim=block_config.attention.mamba.head_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            activation=block_config.ffn.hidden_act,
+            prefix=prefix,
+        )
+        # n_groups is overridden later by `MambaMixer2`
+        self.groups_time_state_size = self.mamba.n_groups * block_config.attention.mamba.state_dim
+        # self.zxbcdt_multipliers = config.ssm_multipliers
+        # self._init_mup_vector()
+
+    def _init_mup_vector(self):
+        """
+        Non learnable per-block scaling vector composed of element-wise 
+        multipliers applied to each separate contiguous block of the output 
+        of the linear projection (in_proj) before further processing
+        (gating, convolution, SSM):
+
+            - Z block:  [0 : d_ssm]                      → zxbcdt_multipliers[0]
+            - X block:  [d_ssm : 2 * d_ssm]              → zxbcdt_multipliers[1]
+            - B block:  [2 * d_ssm : 2 * d_ssm + G * S]  → zxbcdt_multipliers[2]
+            - C block:  [2 * d_ssm + G * S : 2 * d_ssm + 2 * G * S] 
+                        → zxbcdt_multipliers[3]
+            - dt block: [2 * d_ssm + 2 * G * S : end]    → zxbcdt_multipliers[4]
+
+        where:
+            - d_ssm:     Dimension of state-space model latent
+            - G:         Number of groups (n_groups)
+            - S:         SSM state size per group
+            - All indices are divided by tp_size to support tensor parallelism
+        """
+        vector_shape = (2 * self.d_ssm + 2 * self.groups_time_state_size +
+                        self.config.mamba_n_heads) // self.tp_size
+        mup_vector = torch.ones(1, vector_shape)
+        # Z vector 0 -> d_ssm
+        mup_vector[:, :self.d_ssm //
+                   self.tp_size] *= self.zxbcdt_multipliers[0]
+        # X vector d_ssm -> 2 * d_ssm
+        mup_vector[:,
+                   (self.d_ssm //
+                    self.tp_size):(2 * self.d_ssm //
+                                   self.tp_size)] *= self.zxbcdt_multipliers[1]
+        # B vector 2 * d_ssm -> 2 * d_ssm + (n_group * d_state)
+        mup_vector[
+            :,
+            (2 * self.d_ssm) //
+            self.tp_size:(2 * self.d_ssm + self.groups_time_state_size) //
+            self.tp_size,
+        ] *= self.zxbcdt_multipliers[2]
+        # C vector 2 * d_ssm + (n_group * d_state)
+        # -> 2 * d_ssm + 2 * (n_group * d_state)
+        mup_vector[
+            :,
+            (2 * self.d_ssm + self.groups_time_state_size) //
+            self.tp_size:(2 * self.d_ssm + 2 * self.groups_time_state_size) //
+            self.tp_size,
+        ] *= self.zxbcdt_multipliers[3]
+        # dt vector 2 * d_ssm + 2 * (n_group * d_state)
+        # -> 2 * d_ssm + 2 * (n_group * d_state) + n_heads
+        mup_vector[
+            :,
+            (2 * self.d_ssm + 2 * self.groups_time_state_size) //
+            self.tp_size:,
+        ] *= self.zxbcdt_multipliers[4]
+
+        self.register_buffer("mup_vector", mup_vector, persistent=False)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        **kwargs,
+    ):
+        output = torch.empty_like(hidden_states)
+        self.mamba(
+            hidden_states,
+            output,
+            mup_vector=self.mup_vector,
+        )
+        return output, residual
+
+
 class DeciLMDecoderLayer(nn.Module):
 
     def __init__(
@@ -121,6 +223,7 @@ class DeciLMDecoderLayer(nn.Module):
         block_config = config.block_configs[layer_idx]
         self._is_no_op_attention = block_config.attention.no_op
         self._is_no_op_ffn = block_config.ffn.no_op
+        self._is_mamba = hasattr(block_config.attention, "is_mamba") and block_config.attention.is_mamba
 
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -139,6 +242,11 @@ class DeciLMDecoderLayer(nn.Module):
         # support internlm/internlm3-8b with qkv_bias
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
+
+        hidden_activation = config.hidden_act if hasattr(config, "hidden_act") else block_config.ffn.hidden_act
+
+        if self._is_mamba:
+            self.mamba = DeciLMMambaMixer(config, block_config=block_config, prefix=f"{prefix}.mixer")
 
         if not self._is_no_op_attention:
             num_kv_heads = (config.num_attention_heads //
@@ -161,14 +269,18 @@ class DeciLMDecoderLayer(nn.Module):
                                            eps=config.rms_norm_eps)
 
         if not self._is_no_op_ffn:
-            ffn_mult = block_config.ffn.ffn_mult
-            intermediate_size = _ffn_mult_to_intermediate_size(
-                ffn_mult, config.hidden_size)
+            if hasattr(block_config.ffn, "ffn_mult"):
+                ffn_mult = block_config.ffn.ffn_mult
+                intermediate_size = _ffn_mult_to_intermediate_size(
+                    ffn_mult, config.hidden_size
+                )
+            else:
+                intermediate_size = block_config.ffn.intermediate_size
 
             self.mlp = LlamaMLP(
                 hidden_size=self.hidden_size,
                 intermediate_size=intermediate_size,
-                hidden_act=config.hidden_act,
+                hidden_act=hidden_activation,
                 quant_config=quant_config,
                 bias=getattr(config, "mlp_bias", False),
                 prefix=f"{prefix}.mlp",
@@ -184,7 +296,10 @@ class DeciLMDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
 
-        if self._is_no_op_attention:
+        if self._is_mamba:
+            output = self.mamba(hidden_states, residual)
+            return output, residual
+        elif self._is_no_op_attention:
             pass
         else:
             if (residual is None):
@@ -256,7 +371,7 @@ class DeciModel(nn.Module):
             get_layer,
             prefix=f"{prefix}.layers",
         )
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank: 
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
