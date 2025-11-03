@@ -135,7 +135,9 @@ class DeciLMSSMDecoderLayer(nn.Module):
         )
         # n_groups is overridden later by `MambaMixer2`
         self.groups_time_state_size = self.mamba.n_groups * block_config.attention.mamba.state_dim
-        self.zxbcdt_multipliers = config.ssm_multipliers if hasattr(config, "ssm_multipliers") else [1.0, 1.0, 1.0, 1.0, 1.0]
+        # hardcoded since we don't know about the availability of the multipliers
+        # in the config yet but will be overridden later
+        self.zxbcdt_multipliers = getattr(config, "ssm_multipliers", [1.0, 1.0, 1.0, 1.0, 1.0])
         self._init_mup_vector()
 
     def _init_mup_vector(self):
@@ -241,7 +243,7 @@ class DeciLMDecoderLayer(nn.Module):
         if hasattr(config, "qkv_bias"):
             attention_bias = config.qkv_bias
 
-        hidden_activation = config.hidden_act if hasattr(config, "hidden_act") else block_config.ffn.hidden_act
+        hidden_activation = getattr(config, "hidden_act", block_config.ffn.hidden_act)
 
         if not self._is_no_op_attention:
             num_kv_heads = (config.num_attention_heads //
@@ -291,10 +293,7 @@ class DeciLMDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
 
-        if self._is_mamba:
-            output = self.mamba(hidden_states, residual)
-            return output, residual
-        elif self._is_no_op_attention:
+        if self._is_no_op_attention:
             pass
         else:
             if (residual is None):
@@ -340,15 +339,22 @@ class DeciLMParallelHybrid(nn.Module):
         super().__init__()
 
         block_config = config.block_configs[layer_idx]
+        self._is_no_op_ffn = block_config.ffn.no_op
+
+        # Temporarily set the FFN to no_op to avoid double processing
+        config.block_configs[layer_idx].ffn.no_op = True
 
         # Instantiate the attention branch
         self.self_attn = DeciLMDecoderLayer(
-                config=config,
-                layer_idx=layer_idx,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                prefix=prefix,
+            config=config,
+            layer_idx=layer_idx,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attention",
         )
+
+        # Restore the FFN configuration
+        config.block_configs[layer_idx].ffn.no_op = self._is_no_op_ffn
 
         # In V1 all attention/ssm layers must have
         # different index in prefix
@@ -362,12 +368,12 @@ class DeciLMParallelHybrid(nn.Module):
             prefix=ssm_prefix,
         )
         # multipliers are hardcoded since we don't know about the availability
-        # of the multipliers in the config yet
-        self.ssm_out_multiplier = config.ssm_out_multiplier if hasattr(config, "ssm_out_multiplier") else 1.0
-        self.ssm_in_multiplier = config.ssm_in_multiplier if hasattr(config, "ssm_in_multiplier") else 1.0
+        # of the multipliers in the config yet but will be overridden later
+        self.ssm_out_multiplier = getattr(config, "ssm_out_multiplier", 1.0)
+        self.ssm_in_multiplier = getattr(config, "ssm_in_multiplier", 1.0)
 
-        self.attention_in_multiplier = config.attention_in_multiplier if hasattr(config, "attention_in_multiplier") else 1.0
-        self.attn_out_multiplier = config.attention_out_multiplier if hasattr(config, "attention_out_multiplier") else 1.0
+        self.attention_in_multiplier = getattr(config, "attention_in_multiplier", 1.0)
+        self.attn_out_multiplier = getattr(config, "attention_out_multiplier", 1.0)
 
         if not self._is_no_op_ffn:
             if hasattr(block_config.ffn, "ffn_mult"):
@@ -378,7 +384,11 @@ class DeciLMParallelHybrid(nn.Module):
             else:
                 intermediate_size = block_config.ffn.intermediate_size
 
-            self.feed_forward = LlamaMLP(
+            hidden_activation = getattr(config, "hidden_act", block_config.ffn.hidden_act)
+
+            self.post_attention_layernorm = RMSNorm(config.hidden_size,
+                                                    eps=config.rms_norm_eps)
+            self.mlp = LlamaMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=hidden_activation,
@@ -387,11 +397,9 @@ class DeciLMParallelHybrid(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
+        # input layernorm is shared between the attention and SSM branches
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        eps=config.rms_norm_eps)
-        self.pre_ff_layernorm = RMSNorm(config.hidden_size,
-                                        eps=config.rms_norm_eps)
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -423,12 +431,12 @@ class DeciLMParallelHybrid(nn.Module):
         hidden_states = hidden_states + residual
 
         # feed-forward
-        residual = hidden_states
-        hidden_states = self.pre_ff_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
+        if not self._is_no_op_ffn:
+            hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+            hidden_states = self.mlp(hidden_states)
 
-        return hidden_states
+        return hidden_states, residual
+
 
 
 @support_torch_compile
@@ -712,120 +720,3 @@ class FalconH1DeciLMForCausalLM(DeciLMForCausalLM):
 
     def _init_model(self, vllm_config: VllmConfig, prefix: str = ""):
         return DeciModel(vllm_config=vllm_config, prefix=prefix, layer_type=DeciLMParallelHybrid)
-
-
-
-########################################################
-# BACKUP CODE
-########################################################
-
-# class DeciLMDecoderLayer(nn.Module):
-
-#     def __init__(
-#         self,
-#         config: LlamaConfig,
-#         layer_idx: int,
-#         cache_config: Optional[CacheConfig] = None,
-#         quant_config: Optional[QuantizationConfig] = None,
-#         prefix: str = "",
-#     ) -> None:
-#         super().__init__()
-#         block_config = config.block_configs[layer_idx]
-#         self._is_no_op_attention = block_config.attention.no_op
-#         self._is_no_op_ffn = block_config.ffn.no_op
-#         self._is_mamba = hasattr(block_config.attention, "is_mamba") and block_config.attention.is_mamba
-
-#         self.hidden_size = config.hidden_size
-#         rope_theta = getattr(config, "rope_theta", 10000)
-#         rope_scaling = getattr(config, "rope_scaling", None)
-#         if rope_scaling is not None and getattr(
-#                 config, "original_max_position_embeddings", None):
-#             rope_scaling["original_max_position_embeddings"] = (
-#                 config.original_max_position_embeddings)
-#         max_position_embeddings = getattr(config, "max_position_embeddings",
-#                                           8192)
-#         # Support abacusai/Smaug-72B-v0.1 with attention_bias
-#         # Support internlm/internlm-7b with bias
-#         attention_bias = getattr(config, "attention_bias", False) or getattr(
-#             config, "bias", False)
-#         bias_o_proj = attention_bias
-#         # support internlm/internlm3-8b with qkv_bias
-#         if hasattr(config, "qkv_bias"):
-#             attention_bias = config.qkv_bias
-
-#         hidden_activation = config.hidden_act if hasattr(config, "hidden_act") else block_config.ffn.hidden_act
-
-#         if self._is_mamba:
-#             self.mamba = DeciLMMambaMixer(config, block_config=block_config, prefix=f"{prefix}.mixer")
-
-#         if not self._is_mamba and not self._is_no_op_attention:
-#             num_kv_heads = (config.num_attention_heads //
-#                             block_config.attention.n_heads_in_group)
-#             self.self_attn = DeciLMAttention(
-#                 config=config,
-#                 hidden_size=self.hidden_size,
-#                 num_heads=config.num_attention_heads,
-#                 num_kv_heads=num_kv_heads,
-#                 rope_theta=rope_theta,
-#                 rope_scaling=rope_scaling,
-#                 max_position_embeddings=max_position_embeddings,
-#                 quant_config=quant_config,
-#                 bias=attention_bias,
-#                 bias_o_proj=bias_o_proj,
-#                 cache_config=cache_config,
-#                 prefix=f"{prefix}.self_attn",
-#             )
-#             self.input_layernorm = RMSNorm(config.hidden_size,
-#                                            eps=config.rms_norm_eps)
-
-#         if not self._is_no_op_ffn:
-#             if hasattr(block_config.ffn, "ffn_mult"):
-#                 ffn_mult = block_config.ffn.ffn_mult
-#                 intermediate_size = _ffn_mult_to_intermediate_size(
-#                     ffn_mult, config.hidden_size
-#                 )
-#             else:
-#                 intermediate_size = block_config.ffn.intermediate_size
-
-#             self.mlp = LlamaMLP(
-#                 hidden_size=self.hidden_size,
-#                 intermediate_size=intermediate_size,
-#                 hidden_act=hidden_activation,
-#                 quant_config=quant_config,
-#                 bias=getattr(config, "mlp_bias", False),
-#                 prefix=f"{prefix}.mlp",
-#             )
-#             self.post_attention_layernorm = RMSNorm(config.hidden_size,
-#                                                     eps=config.rms_norm_eps)
-
-#     def forward(
-#         self,
-#         positions: torch.Tensor,
-#         hidden_states: torch.Tensor,
-#         residual: Optional[torch.Tensor],
-#     ) -> tuple[torch.Tensor, torch.Tensor]:
-#         # Self Attention
-
-#         if self._is_mamba:
-#             output = self.mamba(hidden_states, residual)
-#             return output, residual
-#         elif self._is_no_op_attention:
-#             pass
-#         else:
-#             if (residual is None):
-#                 residual = hidden_states
-#                 hidden_states = self.input_layernorm(hidden_states)
-#             else:
-#                 hidden_states, residual = self.input_layernorm(
-#                     hidden_states, residual)
-#             hidden_states = self.self_attn(
-#                 positions=positions,
-#                 hidden_states=hidden_states,
-#             )
-
-#         # Fully Connected
-#         if not self._is_no_op_ffn:
-#             hidden_states, residual = self.post_attention_layernorm(
-#                 hidden_states, residual)
-#             hidden_states = self.mlp(hidden_states)
-#         return hidden_states, residual
