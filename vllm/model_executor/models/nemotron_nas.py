@@ -35,6 +35,7 @@ from vllm.attention import AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group
+from vllm.distributed.parallel_state import get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -110,6 +111,39 @@ class DeciLMAttention(LlamaAttention):
             partial_rotary_factor=self.partial_rotary_factor)
 
 
+class DeciLMMambaMixer(nn.Module):
+    def __init__(self, config: LlamaConfig, mamba_config: Any, prefix: str):
+        super().__init__()
+
+        class ModelConfigTmp:
+            def __init__(self, config: LlamaConfig):
+                self.dtype = "bfloat16" #config.block_configs[0].ffn.weights_precision
+                self.mamba_cache_dtype = "bfloat16"
+                self.mamba_ssm_cache_dtype = "bfloat16"
+
+        model_config = ModelConfigTmp(config)
+
+        self.mamba_mixer = MambaMixer2(
+            hidden_size=config.hidden_size,
+            ssm_state_size=mamba_config.state_dim,
+            conv_kernel_size=4,  # hardcoded from megatron_lm__mamba_mixer.py
+            intermediate_size=config.hidden_size,
+            use_conv_bias=False, #config.mamba_conv_bias,
+            use_bias=False, #config.mamba_proj_bias,
+            n_groups=mamba_config.num_groups,
+            num_heads=mamba_config.num_heads,
+            head_dim=mamba_config.head_dim,
+            rms_norm_eps=config.rms_norm_eps,
+            activation="silu", # mamba_config.ffn.hidden_act, # TODO: remove hardcoded activation
+            model_config=model_config,
+            cache_config=model_config,
+            prefix=f"{prefix}.self_attn.mamba_mixer",
+        )
+
+    def forward(self, hidden_states: torch.Tensor, output: torch.Tensor, mup_vector: torch.Tensor):
+        self.mamba_mixer(hidden_states, output, mup_vector)
+
+
 class DeciLMSSMDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -119,26 +153,21 @@ class DeciLMSSMDecoderLayer(nn.Module):
     ):
         super().__init__()
         mamba_config = block_config.attention.mamba
-        self.mamba = MambaMixer2(
-            hidden_size=config.hidden_size,
-            ssm_state_size=mamba_config.state_dim,
-            conv_kernel_size=4,  # hardcoded from megatron_lm__mamba_mixer.py
-            intermediate_size=config.hidden_size,
-            use_conv_bias=True, #config.mamba_conv_bias,
-            use_bias=True, #config.mamba_proj_bias,
-            n_groups=mamba_config.num_groups,
-            num_heads=mamba_config.num_heads,
-            head_dim=mamba_config.head_dim,
-            rms_norm_eps=config.rms_norm_eps,
-            activation=block_config.ffn.hidden_act,
-            prefix=prefix,
-        )
+
+        self.self_attn = DeciLMMambaMixer(config, mamba_config, prefix)
+        self.d_ssm = mamba_config.state_dim
+        self.n_heads = mamba_config.num_heads
+        self.tp_size = get_tensor_model_parallel_world_size()
+
         # n_groups is overridden later by `MambaMixer2`
-        self.groups_time_state_size = self.mamba.n_groups * block_config.attention.mamba.state_dim
+        self.groups_time_state_size = mamba_config.num_groups * self.d_ssm
         # hardcoded since we don't know about the availability of the multipliers
         # in the config yet but will be overridden later
         self.zxbcdt_multipliers = getattr(config, "ssm_multipliers", [1.0, 1.0, 1.0, 1.0, 1.0])
         self._init_mup_vector()
+        self.input_layernorm = RMSNorm(config.hidden_size,
+                                       eps=config.rms_norm_eps)
+
 
     def _init_mup_vector(self):
         """
@@ -161,7 +190,7 @@ class DeciLMSSMDecoderLayer(nn.Module):
             - All indices are divided by tp_size to support tensor parallelism
         """
         vector_shape = (2 * self.d_ssm + 2 * self.groups_time_state_size +
-                        self.config.mamba_n_heads) // self.tp_size
+                        self.n_heads) // self.tp_size
         mup_vector = torch.ones(1, vector_shape)
         # Z vector 0 -> d_ssm
         mup_vector[:, :self.d_ssm //
@@ -201,8 +230,9 @@ class DeciLMSSMDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ):
+        hidden_states = self.input_layernorm(hidden_states)
         output = torch.empty_like(hidden_states)
-        self.mamba(
+        self.self_attn(
             hidden_states,
             output,
             mup_vector=self.mup_vector,
@@ -222,10 +252,14 @@ class DeciLMDecoderLayer(nn.Module):
         block_config: Optional[Any] = None,
     ) -> None:
         super().__init__()
+
         if block_config is None:
             block_config = config.block_configs[layer_idx]
         self._is_no_op_attention = block_config.attention.no_op
-        self._is_no_op_ffn = True # TODO: uncomment this when we have a way to handle the FFN in the SSM branch
+        # TODO: comment this when we have a way to handle the FFN in the SSM branch
+        self._is_no_op_ffn = True
+        # TODO: uncomment this when we have a way to handle the FFN in the SSM branch
+        # self._is_no_op_ffn = block_config.ffn.no_op
 
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -264,8 +298,8 @@ class DeciLMDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 prefix=f"{prefix}.self_attn",
             )
-            self.input_layernorm = RMSNorm(config.hidden_size,
-                                           eps=config.rms_norm_eps)
+            # self.input_layernorm = RMSNorm(config.hidden_size,
+            #                                eps=config.rms_norm_eps)
 
         if not self._is_no_op_ffn:
             if hasattr(block_config.ffn, "ffn_mult"):
@@ -284,6 +318,7 @@ class DeciLMDecoderLayer(nn.Module):
                 bias=getattr(config, "mlp_bias", False),
                 prefix=f"{prefix}.mlp",
             )
+
             self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                     eps=config.rms_norm_eps)
 
@@ -345,25 +380,26 @@ class DeciLMParallelHybrid(nn.Module):
         # (i.e, parallel attention and mamba) config
         block_config = config.block_configs[layer_idx]
         self._is_no_op_ffn = block_config.ffn.no_op
+        # # input layernorm is shared between the attention and SSM branches
+        # self.input_layernorm = RMSNorm(config.hidden_size,
+        #                                eps=config.rms_norm_eps)
+
         self._has_parallel_blocks = block_config.parallel_blocks is not None
-        mamba_block_config = block_config.parallel_blocks[0]
-        attention_block_config = block_config.parallel_blocks[1]
-        # input layernorm is shared between the attention and SSM branches
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
 
         if self._has_parallel_blocks:
+            mamba_block_config = block_config.parallel_blocks[0]
+            attention_block_config = block_config.parallel_blocks[1]
             # Temporarily set the FFN to no_op to avoid double processing
             # config.block_configs[layer_idx].ffn.no_op = True # TODO: uncomment 
             # this when we have a way to handle the FFN in the SSM branch
 
             # Instantiate the attention branch
-            self.self_attn = DeciLMDecoderLayer(
+            self.parallel_blocks_1 = DeciLMDecoderLayer(
                 config=config,
                 layer_idx=layer_idx,
                 cache_config=cache_config,
                 quant_config=quant_config,
-                prefix=f"{prefix}.attention",
+                prefix=f"{prefix}.parallel_blocks_1",
                 block_config=attention_block_config,
             )
 
@@ -371,15 +407,10 @@ class DeciLMParallelHybrid(nn.Module):
             # config.block_configs[layer_idx].ffn.no_op = self._is_no_op_ffn 
             # TODO: uncomment this when we have a way to handle the FFN in the SSM branch
 
-            # In V1 all attention/ssm layers must have
-            # different index in prefix
-            ssm_layer_idx = config.num_hidden_layers + layer_idx
-            ssm_prefix = prefix.split(".")[0] + f".{ssm_layer_idx}"
-
             # Instantiate the SSM branch
-            self.mamba = DeciLMSSMDecoderLayer(
+            self.parallel_blocks_0 = DeciLMSSMDecoderLayer(
                 config=config,
-                prefix=ssm_prefix,
+                prefix=f"{prefix}.parallel_blocks_0",
                 block_config=mamba_block_config,
             )
             # multipliers are hardcoded since we don't know about the availability
@@ -418,39 +449,40 @@ class DeciLMParallelHybrid(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor],
     ):
-        hidden_states = self.input_layernorm(hidden_states)
-        if self._has_parallel_blocks:
-            # Process input through the attention branch.
-            # FalconH1AttentionDecoderLayer expects positions, hidden_states,
-            # kv_cache, attn_metadata, and residual.
-            attn_hidden, _ = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states * self.attention_in_multiplier,
-                residual=residual,
-            )
+        return hidden_states, hidden_states
+        # hidden_states = self.input_layernorm(hidden_states)
+        # if self._has_parallel_blocks:
+        #     # Process input through the attention branch.
+        #     # FalconH1AttentionDecoderLayer expects positions, hidden_states,
+        #     # kv_cache, attn_metadata, and residual.
+        #     attn_hidden, _ = self.parallel_blocks_1(
+        #         positions=positions,
+        #         hidden_states=hidden_states * self.attention_in_multiplier,
+        #         residual=residual,
+        #     )
 
-            # Process input through the SSM branch.
-            # FalconH1SSMDecoderLayer expects hidden_states, attn_metadata,
-            # residual, and sequence_idx.
-            ssm_hidden, _ = self.mamba(
-                hidden_states=hidden_states * self.ssm_in_multiplier,
-                residual=residual,
-            )
-            # Sum the outputs from both branches.
-            # We assume both branches produce outputs of the same
-            # dimensionality (config.hidden_size).
-            hidden_states = (attn_hidden * self.attn_out_multiplier) + (
-                ssm_hidden * self.ssm_out_multiplier)
-            hidden_states = hidden_states + residual
+        #     # Process input through the SSM branch.
+        #     # FalconH1SSMDecoderLayer expects hidden_states, attn_metadata,
+        #     # residual, and sequence_idx.
+        #     ssm_hidden, _ = self.parallel_blocks_0(
+        #         hidden_states=hidden_states * self.ssm_in_multiplier,
+        #         residual=residual,
+        #     )
+        #     # Sum the outputs from both branches.
+        #     # We assume both branches produce outputs of the same
+        #     # dimensionality (config.hidden_size).
+        #     hidden_states = (attn_hidden * self.attn_out_multiplier) + (
+        #         ssm_hidden * self.ssm_out_multiplier)
+        #     hidden_states = hidden_states + residual
 
-        # feed-forward
-        if not self._is_no_op_ffn:
-            residual = hidden_states            
-            hidden_states, _ = self.post_attention_layernorm(hidden_states)
-            hidden_states = self.mlp(hidden_states)
-            hidden_states = residual + hidden_states
+        # # feed-forward
+        # if not self._is_no_op_ffn:
+        #     residual = hidden_states            
+        #     hidden_states, _ = self.post_attention_layernorm(hidden_states)
+        #     hidden_states = self.mlp(hidden_states)
+        #     hidden_states = residual + hidden_states
         
-        return hidden_states, residual
+        # return hidden_states, residual
 
 
 @support_torch_compile
@@ -535,7 +567,7 @@ class DeciModel(nn.Module):
 
         kv_cache_index = 0
         for layer in islice(self.layers, self.start_layer, self.end_layer):
-            if not layer._is_no_op_attention:
+            if getattr(layer, "parallel_blocks_1", None) is not None and not layer.parallel_blocks_1._is_no_op_attention:
                 hidden_states, residual = layer(positions, hidden_states,
                                                 residual)
                 kv_cache_index += 1
@@ -562,6 +594,15 @@ class DeciModel(nn.Module):
             (".gate_up_proj", ".gate_proj", 0),
             (".gate_up_proj", ".up_proj", 1),
         ]
+        name_mapping = {
+            "mamba_mixer.A_log": "mamba_mixer.A",
+        }
+        def maybe_remap_name(name: str) -> str:
+            for k, v in name_mapping.items():
+                if k in name:
+                    return name.replace(k, v)
+            return name
+
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
@@ -611,6 +652,7 @@ class DeciModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
+                name = maybe_remap_name(name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
@@ -650,10 +692,12 @@ class DeciLMForCausalLM(nn.Module, SupportsLoRA, SupportsPP, HasNoOps):
         "tok_embeddings": "model.embed_tokens",
         "output": "lm_head",
         "norm": "model.norm",
+        "A": "A_log",
     }
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         lora_config = vllm_config.lora_config
