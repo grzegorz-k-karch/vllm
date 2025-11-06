@@ -1128,7 +1128,6 @@ class ModelConfig:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of
         # KV heads.
-
         falcon_model_types = ["falcon", "RefinedWeb", "RefinedWebModel"]
         new_decoder_arch_falcon = (
             self.hf_config.model_type in falcon_model_types
@@ -1168,7 +1167,6 @@ class ModelConfig:
             # For ChatGLM:
             "multi_query_group_num",
         ]
-
         for attr in attributes:
             num_kv_heads = getattr(self.hf_text_config, attr, None)
             if num_kv_heads is not None:
