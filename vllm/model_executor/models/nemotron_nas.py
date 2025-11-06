@@ -568,7 +568,7 @@ class DeciModel(nn.Module):
     ) -> Union[torch.Tensor, IntermediateTensors]:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
-                    hidden_states = inputs_embeds
+                hidden_states = inputs_embeds
             else:
                 hidden_states = self.get_input_embeddings(input_ids)
             # residual = None
