@@ -295,7 +295,6 @@ class DeciLMDecoderLayer(nn.Module):
         if not self._is_no_op_attention:
             num_kv_heads = (config.num_attention_heads //
                             block_config.attention.n_heads_in_group)
-            print(f"|||| nemotron_nas.py: {num_kv_heads=}, {config.num_attention_heads=}, {block_config.attention.n_heads_in_group=}")
             self.self_attn = DeciLMAttention(
                 config=config,
                 hidden_size=self.hidden_size,
@@ -741,8 +740,6 @@ class DeciLMForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP, HasN
         
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-
-        print("|||| cache config: ", vllm_config.cache_config)
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
