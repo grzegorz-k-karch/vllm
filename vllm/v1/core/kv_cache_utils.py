@@ -881,7 +881,6 @@ def is_kv_cache_page_size_uniform(
     """
 
     page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
-    print(f"|||| page_sizes: {page_sizes}")
     return len(page_sizes) == 1
 
 
@@ -1161,44 +1160,30 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
-
-    # # print(f"|||| kv_cache_spec: {kv_cache_spec}")
-    # # INSERT_YOUR_CODE
-    # import traceback
-    # print(f"|||| get_kv_cache_groups stack trace: ")
-    # traceback.print_stack()
-    
-    print("|||| VllmConfig: ", vllm_config)
-
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        print(f"|||| disable_hybrid_kv_cache_manager: True")
         unify_hybrid_kv_cache_specs(kv_cache_spec)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
-        print(f"|||| is_kv_cache_type_attention_free: True")
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
     elif is_kv_cache_spec_uniform(kv_cache_spec):
-        print(f"|||| is_kv_cache_spec_uniform: True")
         # KV cache of all layers are the same, which is true for
         # most models. Allocate the same amount of memory for
         # each layer.
         return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
     elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
-        print(f"|||| UniformTypeKVCacheSpecs.from_specs: True")
         # All layers need the same number of token slots (e.g., all layers are
         # full attention, or all layers are sliding window attention with the
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
     elif is_kv_cache_page_size_uniform(kv_cache_spec):
-        print(f"|||| is_kv_cache_page_size_uniform: True")
         # Model contains multiple attention types, but KV cache of all layers
         # have the same physical memory per block per layer. Split the layers
         # into groups with the same number of layers, and thus same total page
         # size.
         return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
-    print(f"|||| raise NotImplementedError")
+
     raise NotImplementedError
 
 
