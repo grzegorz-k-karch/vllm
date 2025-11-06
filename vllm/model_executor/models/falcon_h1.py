@@ -255,8 +255,6 @@ class FalconH1AttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        print(f"|||| falcon_h1.py: {self.num_kv_heads=}, {self.num_heads=}, {self.total_num_kv_heads=}, {self.total_num_heads=}")
-
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -549,7 +547,6 @@ class FalconH1ForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP,
                 ), "FalconH1 currently does not support prefix caching"
 
         self.quant_config = vllm_config.quant_config
-        print("|||| cache config: ", vllm_config.cache_config)
 
         super().__init__()
         self.config = config
