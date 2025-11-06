@@ -164,7 +164,7 @@ class DeciLMSSMDecoderLayer(nn.Module):
         super().__init__()
         mamba_config = block_config.attention.mamba
 
-        self.d_ssm = 4096 #config.hidden_size
+        self.d_ssm = 4096 #config.hidden_size # TODO: remove hardcoded d_ssm
         self.n_heads = mamba_config.num_heads
         self.tp_size = get_tensor_model_parallel_world_size()
         self.self_attn = DeciLMMambaMixer(config, mamba_config, quant_config, 
