@@ -62,8 +62,13 @@ class AttentionSpec(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        return 2 * self.block_size * self.num_kv_heads * self.head_size \
-                * get_dtype_size(self.dtype)
+        import sys
+        import traceback
+        print(f"|||| AttentionSpec page_size_bytes: stacktrace: {self.block_size=}, {self.num_kv_heads=}")
+        traceback.print_stack(file=sys.stdout)
+        psb = 2 * self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+        print(f"|||| AttentionSpec page_size_bytes: 2 * {self.block_size} * {self.num_kv_heads} * {self.head_size} * {get_dtype_size(self.dtype)} = {psb}")
+        return psb
 
 
 @dataclass(frozen=True)
@@ -148,9 +153,12 @@ class MLAAttentionSpec(FullAttentionSpec):
         if self.cache_dtype_str == "fp8_ds_mla":
             # See `vllm/v1/attention/backends/mla/flashmla_sparse.py`
             #  for details.
-            return self.block_size * 656
-        return self.block_size * self.num_kv_heads * self.head_size \
-                * get_dtype_size(self.dtype)
+            psb = self.block_size * 656
+            print(f"|||| MLAAttentionSpec page_size_bytes: {self.block_size} * 656 = {psb}")
+            return psb
+        psb = self.block_size * self.num_kv_heads * self.head_size * get_dtype_size(self.dtype)
+        print(f"|||| MLAAttentionSpec page_size_bytes: {self.block_size} * {self.num_kv_heads} * {self.head_size} * {get_dtype_size(self.dtype)} = {psb}")
+        return psb
 
     @classmethod
     def merge(cls, specs: list[Self]) -> Self:
@@ -229,7 +237,9 @@ class MambaSpec(KVCacheSpec):
             for (shape, dtype) in zip(self.shapes, self.dtypes))
         if self.page_size_padded is not None:
             assert self.page_size_padded >= page_size
+            print(f"|||| MambaSpec page_size_bytes (padded): {self.page_size_padded}")
             return self.page_size_padded
+        print(f"|||| MambaSpec page_size_bytes (unpadded): {page_size}")
         return page_size
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
@@ -273,8 +283,9 @@ class UniformTypeKVCacheSpecs(KVCacheSpec):
 
     @property
     def page_size_bytes(self) -> int:
-        return sum(spec.page_size_bytes
-                   for spec in self.kv_cache_specs.values())
+        psb = sum(spec.page_size_bytes for spec in self.kv_cache_specs.values())
+        print(f"|||| UniformTypeKVCacheSpecs page_size_bytes: {psb}")
+        return psb
 
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_num_pages = max(

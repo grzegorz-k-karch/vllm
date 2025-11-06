@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from copy import deepcopy
 from typing import TYPE_CHECKING
-
+import sys
 import vllm.envs as envs
 from vllm.config.compilation import CUDAGraphMode
 from vllm.logger import init_logger
@@ -336,10 +336,14 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
+        print(f"|||| config.py: {model_config=}, {parallel_config=}")
+
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
         else:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+        print(f"|||| config.py: {model_config.get_num_kv_heads(parallel_config)=}")
 
         # get attention page size (for 1 token)
         attn_page_size_1_token = FullAttentionSpec(
@@ -381,6 +385,7 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         # compute new attention page size
         attn_page_size = \
             cache_config.block_size * attn_page_size_1_token
+        print(f"|||| config.py: {cache_config.block_size=}, {attn_page_size_1_token=}")
 
         assert attn_page_size >= mamba_page_size
 
@@ -388,6 +393,12 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
             # don't need to pad mamba page size
             return
 
+        import traceback
+        print("|||| config.py: stacktrace: ")
+        traceback.print_stack(file=sys.stdout)
+
+        print("|||| config.py: attn_page_size: ", attn_page_size)
+        print("|||| config.py: mamba_page_size: ", mamba_page_size)
         # pad mamba page size to exactly match attention
         if (cache_config.mamba_page_size_padded is None
                 or cache_config.mamba_page_size_padded != attn_page_size):
