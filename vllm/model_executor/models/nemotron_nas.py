@@ -498,7 +498,7 @@ class DeciLMParallelHybrid(nn.Module):
         return hidden_states
 
 
-# @support_torch_compile # TODO: uncomment
+@support_torch_compile
 class DeciModel(nn.Module):
 
     def __init__(
