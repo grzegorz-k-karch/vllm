@@ -133,10 +133,10 @@ class DeciLMMambaMixer(nn.Module):
         self.mamba_mixer = MambaMixer2(
             hidden_size=config.hidden_size,
             ssm_state_size=mamba_config.state_dim,
-            conv_kernel_size=4,  # hardcoded from megatron_lm__mamba_mixer.py
+            conv_kernel_size=config.mamba_d_conv,
             intermediate_size=d_ssm,
-            use_conv_bias=False, #config.mamba_conv_bias,
-            use_bias=False, #config.mamba_proj_bias,
+            use_conv_bias=config.mamba_conv_bias,
+            use_bias=config.mamba_proj_bias,
             n_groups=mamba_config.num_groups,
             num_heads=mamba_config.num_heads,
             head_dim=mamba_config.head_dim,
