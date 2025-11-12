@@ -564,13 +564,6 @@ class DeciModel(nn.Module):
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(positions, hidden_states)
             
-            # if getattr(layer, "parallel_blocks_1", None) is not None and not layer.parallel_blocks_1._is_no_op_attention:
-            #  hidden_states, residual = layer(positions, hidden_states, residual)
-            #     kv_cache_index += 1
-            # else:
-            #     hidden_states, residual = layer(positions, hidden_states,
-            #                                     residual)
-
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({
                 "hidden_states": hidden_states,
