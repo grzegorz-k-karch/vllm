@@ -261,16 +261,14 @@ class DeciLMDecoderLayer(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         block_config: Optional[Any] = None,
+        skip_ffn_for_hybrid: bool = False,
     ) -> None:
         super().__init__()
 
         if block_config is None:
             block_config = config.block_configs[layer_idx]
         self._is_no_op_attention = block_config.attention.no_op
-        # TODO: comment this when we have a way to handle the FFN in the SSM branch
-        self._is_no_op_ffn = True
-        # TODO: uncomment this when we have a way to handle the FFN in the SSM branch
-        # self._is_no_op_ffn = block_config.ffn.no_op
+        self._is_no_op_ffn = block_config.ffn.no_op or skip_ffn_for_hybrid
 
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -309,7 +307,7 @@ class DeciLMDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 prefix=f"{prefix}.self_attn",
             )
-            # LAYERNORM
+
             self.input_layernorm = RMSNorm(config.hidden_size,
                                            eps=config.rms_norm_eps)
 
@@ -346,7 +344,6 @@ class DeciLMDecoderLayer(nn.Module):
             pass
         else:
             residual = hidden_states
-            # LAYERNORM
             hidden_states = self.input_layernorm(hidden_states)
             hidden_states = self.self_attn(
                 positions=positions,
@@ -384,22 +381,13 @@ class DeciLMParallelHybrid(nn.Module):
     ) -> None:
         super().__init__()
 
-        # block_config has the attentionm, ffn config and parallel_blocks 
-        # (i.e, parallel attention and mamba) config
         block_config = config.block_configs[layer_idx]
         self._is_no_op_ffn = block_config.ffn.no_op
-        # # input layernorm is shared between the attention and SSM branches
-        # self.input_layernorm = RMSNorm(config.hidden_size,
-        #                                eps=config.rms_norm_eps)
-
         self._has_parallel_blocks = block_config.parallel_blocks is not None
 
         if self._has_parallel_blocks:
             mamba_block_config = block_config.parallel_blocks[0]
             attention_block_config = block_config.parallel_blocks[1]
-            # Temporarily set the FFN to no_op to avoid double processing
-            # config.block_configs[layer_idx].ffn.no_op = True # TODO: uncomment 
-            # this when we have a way to handle the FFN in the SSM branch
 
             # Instantiate the attention branch
             self.parallel_blocks_1 = DeciLMDecoderLayer(
@@ -409,11 +397,8 @@ class DeciLMParallelHybrid(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.parallel_blocks_1",
                 block_config=attention_block_config,
+                skip_ffn_for_hybrid=True,
             )
-
-            # Restore the FFN configuration
-            # config.block_configs[layer_idx].ffn.no_op = self._is_no_op_ffn 
-            # TODO: uncomment this when we have a way to handle the FFN in the SSM branch
 
             # Instantiate the SSM branch
             self.parallel_blocks_0 = DeciLMSSMDecoderLayer(
