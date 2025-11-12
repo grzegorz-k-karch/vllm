@@ -309,8 +309,9 @@ class DeciLMDecoderLayer(nn.Module):
                 cache_config=cache_config,
                 prefix=f"{prefix}.self_attn",
             )
-            # self.input_layernorm = RMSNorm(config.hidden_size,
-            #                                eps=config.rms_norm_eps)
+            # LAYERNORM
+            self.input_layernorm = RMSNorm(config.hidden_size,
+                                           eps=config.rms_norm_eps)
 
         if not self._is_no_op_ffn:
             if hasattr(block_config.ffn, "ffn_mult"):
@@ -344,13 +345,9 @@ class DeciLMDecoderLayer(nn.Module):
         if self._is_no_op_attention:
             pass
         else:
-            # TODO: uncomment this when we have a way to handle the input layernorm in the SSM branch
-            # if (residual is None):
-            #     residual = hidden_states
-            #     hidden_states = self.input_layernorm(hidden_states)
-            # else:
-            #     hidden_states, residual = self.input_layernorm(
-            #         hidden_states, residual)
+            residual = hidden_states
+            # LAYERNORM
+            hidden_states = self.input_layernorm(hidden_states)
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -425,6 +422,7 @@ class DeciLMParallelHybrid(nn.Module):
                 block_config=mamba_block_config,
                 quant_config=quant_config,
             )
+
             # multipliers are hardcoded since we don't know about the availability
             # of the multipliers in the config yet but will be overridden later
             self.ssm_out_multiplier = getattr(config, "ssm_out_multiplier", 1.0)
@@ -608,6 +606,7 @@ class DeciModel(nn.Module):
         ]
         name_mapping = {
             "mamba_mixer.A_log": "mamba_mixer.A",
+            # "parallel_blocks_0.input_layernorm.weight": "parallel_blocks_1.input_layernorm.weight",
         }
         def maybe_remap_name(name: str) -> str:
             for k, v in name_mapping.items():
@@ -669,9 +668,18 @@ class DeciModel(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
+                if "parallel_blocks_0.input_layernorm.weight" in name:
+                    name_1 = name.replace("parallel_blocks_0.input_layernorm.weight", "parallel_blocks_1.input_layernorm.weight")
+                    param_1 = params_dict[name_1]
+                    weight_loader_1 = getattr(param_1, "weight_loader", 
+                                              default_weight_loader)
+                    weight_loader_1(param_1, loaded_weight)
+                    loaded_params.add(name_1)
+
+            loaded_params.add(name)
+
+        return loaded_params
 
 class DeciLMForCausalLM(nn.Module, HasInnerState, SupportsLoRA, SupportsPP, HasNoOps, IsHybrid):
     packed_modules_mapping = {
