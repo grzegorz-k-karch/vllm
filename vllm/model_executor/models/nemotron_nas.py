@@ -584,17 +584,21 @@ class DeciModel(nn.Module):
         ]
         name_mapping = {
             "mamba_mixer.A_log": "mamba_mixer.A",
-            # "parallel_blocks_0.input_layernorm.weight": "parallel_blocks_1.input_layernorm.weight",
+            "parallel_blocks.0": "parallel_blocks_0",
+            "parallel_blocks.1": "parallel_blocks_1",
         }
         def maybe_remap_name(name: str) -> str:
             for k, v in name_mapping.items():
                 if k in name:
-                    return name.replace(k, v)
+                    name = name.replace(k, v)
             return name
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+
+            name = maybe_remap_name(name)
+
             if "rotary_emb.inv_freq" in name:
                 continue
             if ("rotary_emb.cos_cached" in name
@@ -641,7 +645,6 @@ class DeciModel(nn.Module):
                 if is_pp_missing_parameter(name, self):
                     continue
 
-                name = maybe_remap_name(name)
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
