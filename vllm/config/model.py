@@ -1201,9 +1201,12 @@ class ModelConfig:
             self._verify_with_expert_parallelism()
 
         pipeline_parallel_size = parallel_config.pipeline_parallel_size
-        if pipeline_parallel_size > 1 and not self.registry.is_pp_supported_model(
-            self.architectures, self
-        ):
+        # Config-aware model adapters such as AnyModel replace ``_model_info``
+        # with the resolved base architecture's capabilities during model
+        # config validation. Re-inspecting the static registry entry here
+        # loses that information and incorrectly rejects dynamic wrappers
+        # whose concrete base implements SupportsPP.
+        if pipeline_parallel_size > 1 and not self.is_pp_supported:
             raise NotImplementedError(
                 "Pipeline parallelism is not supported for this model. "
                 "Supported models implement the `SupportsPP` interface."
