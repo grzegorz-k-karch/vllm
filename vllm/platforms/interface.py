@@ -504,27 +504,91 @@ class Platform:
             return
 
         backend_cls = cls._find_non_ssm_backend(vllm_config)
-        if backend_cls is None:
+        if backend_cls is not None:
+            # Phase 1: Pick block size from backend (skip if user set
+            # --block-size).
+            if not cache_config.user_specified_block_size:
+                with set_current_vllm_config(vllm_config):
+                    preferred = backend_cls.get_preferred_block_size(
+                        CacheConfig.DEFAULT_BLOCK_SIZE
+                    )
+                if preferred != CacheConfig.DEFAULT_BLOCK_SIZE:
+                    logger.info(
+                        "Setting kv cache block size to %d for %s backend.",
+                        preferred,
+                        backend_cls.get_name(),
+                    )
+                cache_config.block_size = preferred
+
+            # Phase 2: Align block/mamba sizes for hybrid models
+            # (may override user settings).
+            if model_config.is_hybrid:
+                cls._align_hybrid_block_size(vllm_config, backend_cls)
+
+        # A pipeline stage may contain only recurrent layers, so it cannot
+        # discover a non-SSM backend locally. Cache specs nevertheless require
+        # every stage to use the same hybrid page layout. Reconcile the layout
+        # after all stages have had a chance to infer it from their local
+        # layers, selecting the unique layout reported by an attention-bearing
+        # stage rather than assuming that stage is PP rank zero.
+        if model_config.is_hybrid:
+            cls._sync_hybrid_cache_config_across_pp(
+                vllm_config, has_non_ssm_backend=backend_cls is not None
+            )
+
+    @classmethod
+    def _sync_hybrid_cache_config_across_pp(
+        cls,
+        vllm_config: "VllmConfig",
+        *,
+        has_non_ssm_backend: bool,
+    ) -> None:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.pipeline_parallel_size <= 1:
             return
 
-        # Phase 1: Pick block size from backend (skip if user set --block-size)
-        if not cache_config.user_specified_block_size:
-            with set_current_vllm_config(vllm_config):
-                preferred = backend_cls.get_preferred_block_size(
-                    CacheConfig.DEFAULT_BLOCK_SIZE
-                )
-            if preferred != CacheConfig.DEFAULT_BLOCK_SIZE:
-                logger.info(
-                    "Setting kv cache block size to %d for %s backend.",
-                    preferred,
-                    backend_cls.get_name(),
-                )
-            cache_config.block_size = preferred
+        # Platform.update_block_size_for_backend() is normally called after
+        # distributed groups are initialized. Keep direct config/unit-test
+        # callers working when no process group exists yet.
+        if not torch.distributed.is_initialized():
+            return
 
-        # Phase 2: Align block/mamba sizes for hybrid models
-        # (may override user settings).
-        if model_config.is_hybrid:
-            cls._align_hybrid_block_size(vllm_config, backend_cls)
+        from vllm.distributed import get_pp_group
+
+        pp_group = get_pp_group()
+        cache_config = vllm_config.cache_config
+        local_layout = (
+            (
+                cache_config.block_size,
+                cache_config.mamba_block_size,
+                cache_config.mamba_page_size_padded,
+            )
+            if has_non_ssm_backend
+            else None
+        )
+        layouts: list[tuple[int, int | None, int | None] | None] = [
+            None
+        ] * pp_group.world_size
+        torch.distributed.all_gather_object(
+            layouts, local_layout, group=pp_group.cpu_group
+        )
+        resolved_layouts = {layout for layout in layouts if layout is not None}
+        if not resolved_layouts:
+            raise RuntimeError(
+                "Hybrid cache alignment could not find a non-SSM attention "
+                "backend on any pipeline stage."
+            )
+        if len(resolved_layouts) != 1:
+            raise RuntimeError(
+                "Pipeline stages inferred incompatible hybrid cache layouts: "
+                f"{sorted(resolved_layouts, key=repr)}"
+            )
+
+        (
+            cache_config.block_size,
+            cache_config.mamba_block_size,
+            cache_config.mamba_page_size_padded,
+        ) = resolved_layouts.pop()
 
     @classmethod
     def _align_hybrid_block_size(
