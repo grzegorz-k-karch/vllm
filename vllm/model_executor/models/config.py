@@ -69,7 +69,34 @@ class AnyModelConfig(VerifyAndUpdateConfig):
 
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
-        """Delegate VllmConfig-level tuning to the base architecture's hook."""
+        """Apply AnyModel safety settings, then delegate to the base hook."""
+        text_config = vllm_config.model_config.hf_config.get_text_config()
+        per_layer_config = getattr(text_config, "per_layer_config", None) or {}
+
+        def _skip(entry):
+            if isinstance(entry, dict):
+                return entry.get("skip") or ()
+            return getattr(entry, "skip", None) or ()
+
+        if any(_skip(entry) for entry in per_layer_config.values()):
+            # CUDA graph capture currently assumes the base architecture's full
+            # module topology. AnyModel can replace an attention/GDN or MLP with
+            # a no-op after base-model construction; replaying the captured base
+            # graph can then execute a removed module and corrupt hybrid state.
+            # Keep torch.compile enabled, but use its non-CUDAGraph path until
+            # no-op-aware capture is implemented.
+            from vllm.config.compilation import CUDAGraphMode
+
+            if (
+                vllm_config.compilation_config.cudagraph_mode
+                != CUDAGraphMode.NONE
+            ):
+                logger.warning(
+                    "Disabling CUDA graphs for AnyModel with no-op layers; "
+                    "torch.compile remains enabled."
+                )
+                vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
+
         base_arch = getattr(
             vllm_config.model_config.hf_config, "base_architecture", None
         )
