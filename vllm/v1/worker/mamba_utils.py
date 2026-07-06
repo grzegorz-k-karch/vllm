@@ -211,8 +211,31 @@ def get_mamba_groups(kv_cache_config: KVCacheConfig) -> tuple[list[int], MambaSp
             mamba_group_ids.append(i)
             mamba_specs.append(kv_cache_spec)
     assert len(mamba_group_ids) > 0, "no mamba layers in the model"
-    assert all(mamba_specs[0] == spec for spec in mamba_specs)
-    return mamba_group_ids, mamba_specs[0]
+    reference = mamba_specs[0]
+    # Heterogeneous AnyModel checkpoints may prune the state shape of each
+    # Mamba/GDN layer independently.  The copy path below reads every state's
+    # concrete address, stride, shape, and dtype from ``forward_context``; it
+    # only shares scheduling geometry across groups.  Requiring full dataclass
+    # equality therefore rejects valid heterogeneous shapes even when their
+    # block scheduling is compatible.
+    scheduling_fields = (
+        "block_size",
+        "num_speculative_blocks",
+        "mamba_cache_mode",
+        "mamba_type",
+    )
+    for spec in mamba_specs[1:]:
+        mismatched = [
+            field
+            for field in scheduling_fields
+            if getattr(spec, field) != getattr(reference, field)
+        ]
+        if mismatched:
+            raise ValueError(
+                "Mamba cache groups have incompatible scheduling fields "
+                f"{mismatched}; reference={reference}, candidate={spec}"
+            )
+    return mamba_group_ids, reference
 
 
 @dataclasses.dataclass
