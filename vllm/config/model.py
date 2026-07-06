@@ -630,8 +630,10 @@ class ModelConfig:
         # AnyModel needs to patch _model_info / runner_type before the
         # pooler/multimodal blocks read them; every other hook stays at
         # the original late call site below to preserve init ordering.
-        # The late call is idempotent via the config_updated flag.
-        self.config_updated = False
+        # The late call is idempotent via the model-config-specific flag. Keep
+        # this separate from VllmConfig's update hook: the two hooks accept
+        # different objects and both must run.
+        self.model_config_updated = False
         if self.architecture == "AnyModel":
             self._try_verify_and_update_model_config()
 
@@ -745,7 +747,7 @@ class ModelConfig:
             self.hf_text_config.sliding_window = None
 
         # Original late call site for non-AnyModel hooks. For AnyModel
-        # this is a no-op because config_updated was set by the early call.
+        # this is a no-op because model_config_updated was set by the early call.
         self._try_verify_and_update_model_config()
         self._verify_quantization()
         self._verify_cuda_graph()
@@ -1146,7 +1148,7 @@ class ModelConfig:
 
     def _try_verify_and_update_model_config(self):
         # Avoid running try_verify_and_update_config multiple times
-        if getattr(self, "config_updated", False):
+        if getattr(self, "model_config_updated", False):
             return
 
         architecture = self.architecture
@@ -1159,7 +1161,7 @@ class ModelConfig:
         if cls is None:
             return
         cls.verify_and_update_model_config(self)
-        self.config_updated = True
+        self.model_config_updated = True
 
     def verify_dual_chunk_attention_config(
         self,
