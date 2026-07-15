@@ -122,6 +122,9 @@ class NoOpAttention(nn.Module):
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         if "hidden_states" in kwargs:
+            if "output" in kwargs:
+                kwargs["output"].copy_(kwargs["hidden_states"])
+                return kwargs["output"]
             return kwargs["hidden_states"]
         return args[0]
 
@@ -176,6 +179,23 @@ class ArchInfo:
     layers_path: str = "model.layers"
     init_prefix: str | None = None  # None = inherit from engine
     layer_hf_config: str | None = None  # None = use hf_config directly
+
+
+def _resolve_layer_base_config(config, arch_info: "ArchInfo"):
+    """Return the config that carries ``per_layer_config`` / ``layer_types``.
+
+    ``arch_info.layer_hf_config`` names a sub-config (e.g. ``"text_config"``)
+    on the top-level multimodal config. Depending on the call site, ``config``
+    may be that top-level config (during ``__init__``) or already the resolved
+    sub-config (``self.config`` during ``load_weights``, which the base text
+    model sets to its own text config). Handle both: use the named sub-config
+    when present, otherwise fall back to ``config`` itself.
+    """
+    key = arch_info.layer_hf_config
+    if not key:
+        return config
+    sub = getattr(config, key, None)
+    return sub if sub is not None else config
 
 
 _ARCH_REGISTRY: dict[str, ArchInfo] = {
@@ -282,23 +302,33 @@ def _create_layer_config(global_config, layer_overrides, info: ArchInfo):
     return config
 
 
+def _attention_module_name(layer: nn.Module, info: ArchInfo) -> str:
+    """Resolve the concrete attention attribute of a heterogeneous layer."""
+    candidates = (info.attn_module, "linear_attn", "self_attn", "attention")
+    for name in dict.fromkeys(candidates):
+        if hasattr(layer, name):
+            return name
+    return info.attn_module
+
+
 def _apply_no_ops(layer: nn.Module, layer_overrides, info: ArchInfo) -> None:
     """Replace sub-modules with no-ops per the layer's ``"skip"`` list."""
     skip = _layer_skip_set(layer_overrides)
     attn_noop = _SKIP_GROUP_ATTENTION in skip
     ffn_noop = _SKIP_GROUP_MLP in skip
 
-    shared_module = info.attn_module == info.ffn_module
+    attn_module = _attention_module_name(layer, info)
+    shared_module = attn_module == info.ffn_module
     shared_norm = info.attn_norm_module == info.ffn_norm_module
 
     if shared_module:
         if attn_noop and ffn_noop:
-            setattr(layer, info.attn_module, NoOpAttention())
+            setattr(layer, attn_module, NoOpAttention())
         if shared_norm and attn_noop and ffn_noop:
             setattr(layer, info.attn_norm_module, NoOpNorm())
     else:
         if attn_noop:
-            setattr(layer, info.attn_module, NoOpAttention())
+            setattr(layer, attn_module, NoOpAttention())
             setattr(layer, info.attn_norm_module, NoOpNorm())
         if ffn_noop:
             setattr(layer, info.ffn_module, NoOpMLP())
@@ -306,25 +336,35 @@ def _apply_no_ops(layer: nn.Module, layer_overrides, info: ArchInfo) -> None:
                 setattr(layer, info.ffn_norm_module, NoOpNorm())
 
 
-def _collect_noop_prefixes(per_layer_config: dict, info: ArchInfo) -> frozenset[str]:
+def _collect_noop_prefixes(
+    per_layer_config: dict, info: ArchInfo, model: nn.Module
+) -> frozenset[str]:
     """Build weight-name prefixes (ending with '.') for no-op sub-modules."""
     prefixes: set[str] = set()
-    shared_module = info.attn_module == info.ffn_module
     shared_norm = info.attn_norm_module == info.ffn_norm_module
+
+    layers = model
+    for part in info.layers_path.split("."):
+        layers = getattr(layers, part)
 
     for idx, entry in _iter_layer_overrides(per_layer_config):
         lp = f"{info.layers_path}.{idx}"
         skip = _layer_skip_set(entry)
         attn_noop = _SKIP_GROUP_ATTENTION in skip
         ffn_noop = _SKIP_GROUP_MLP in skip
+        layer = layers[idx] if 0 <= idx < len(layers) else None
+        attn_module = (
+            _attention_module_name(layer, info) if layer is not None else info.attn_module
+        )
+        shared_module = attn_module == info.ffn_module
 
         if shared_module:
             if attn_noop and ffn_noop:
-                prefixes.add(f"{lp}.{info.attn_module}.")
+                prefixes.add(f"{lp}.{attn_module}.")
                 prefixes.add(f"{lp}.{info.attn_norm_module}.")
         else:
             if attn_noop:
-                prefixes.add(f"{lp}.{info.attn_module}.")
+                prefixes.add(f"{lp}.{attn_module}.")
                 prefixes.add(f"{lp}.{info.attn_norm_module}.")
             if ffn_noop:
                 prefixes.add(f"{lp}.{info.ffn_module}.")
@@ -346,8 +386,17 @@ def _instantiate_layer(
     layer_idx: int,
 ) -> nn.Module:
     """Instantiate a decoder layer, patching vllm_config with per-layer config."""
+    from vllm.transformers_utils.config import get_hf_text_config
+
     mock_mc = copy.copy(vllm_config.model_config)
     mock_mc.hf_config = per_layer_config
+    # ``hf_text_config`` is a cached field on ModelConfig (set once at init),
+    # not recomputed from ``hf_config``. Decoder layers that read
+    # ``vllm_config.model_config.hf_text_config`` (e.g. Qwen3.5 / Qwen3-Next)
+    # would otherwise see the stale global config and ignore per-layer
+    # overrides such as ``num_key_value_heads``. ``per_layer_config`` is the
+    # resolved (text) config that carries the override, so point both at it.
+    mock_mc.hf_text_config = get_hf_text_config(per_layer_config)
     mock_vc = copy.copy(vllm_config)
     mock_vc.model_config = mock_mc
 
@@ -362,6 +411,14 @@ def _instantiate_layer(
         "layer_idx": layer_idx,
     }
     params = _layer_init_params(layer_cls)
+    if "layer_type" in params:
+        layer_types = getattr(per_layer_config, "layer_types", None)
+        if layer_types is None or layer_idx >= len(layer_types):
+            raise ValueError(
+                f"Layer class {layer_cls.__name__} requires layer_type, "
+                "but config.layer_types is missing or too short."
+            )
+        _pool["layer_type"] = layer_types[layer_idx]
     return layer_cls(**{k: v for k, v in _pool.items() if k in params})
 
 
@@ -398,11 +455,7 @@ def _patch_anymodel_layers(
 ) -> None:
     """Post-init: rebuild layers with overrides and apply no-ops."""
     config = vllm_config.model_config.hf_config
-    layer_base_config = (
-        getattr(config, arch_info.layer_hf_config)
-        if arch_info.layer_hf_config
-        else config
-    )
+    layer_base_config = _resolve_layer_base_config(config, arch_info)
     per_layer_config = layer_base_config.per_layer_config
 
     obj = model
@@ -451,17 +504,18 @@ def _patch_anymodel_layers(
         skip = _layer_skip_set(layer_overrides)
         attn_noop = _SKIP_GROUP_ATTENTION in skip
         ffn_noop = _SKIP_GROUP_MLP in skip
-        shared_module = arch_info.attn_module == arch_info.ffn_module
+        attn_module = _attention_module_name(layer, arch_info)
+        shared_module = attn_module == arch_info.ffn_module
 
         if shared_module:
             if attn_noop and ffn_noop:
                 _unregister_layer(
-                    f"{layer_prefix}.{arch_info.attn_module}", vllm_config
+                    f"{layer_prefix}.{attn_module}", vllm_config
                 )
         else:
             if attn_noop:
                 _unregister_layer(
-                    f"{layer_prefix}.{arch_info.attn_module}", vllm_config
+                    f"{layer_prefix}.{attn_module}", vllm_config
                 )
             if ffn_noop:
                 _unregister_layer(f"{layer_prefix}.{arch_info.ffn_module}", vllm_config)
@@ -480,16 +534,83 @@ def _arch_info_from_config(hf_config) -> ArchInfo | None:
     return arch_info
 
 
+# Class-level hooks a hybrid (mamba) base model must expose for vLLM to compute
+# its KV-cache spec and (in ``mamba_cache_mode=align``) its state-copy buffers.
+# A text-only base class (e.g. Qwen3_5ForCausalLM) may omit these even though it
+# has linear_attention layers, while a sibling in the same module (the
+# multimodal *ForConditionalGeneration) defines them.
+_HYBRID_STATE_HOOKS = (
+    "get_mamba_state_shape_from_config",
+    "get_mamba_state_dtype_from_config",
+    "get_mamba_state_copy_func",
+)
+
+
+def _borrow_hybrid_state_hooks(mod, base_cls) -> dict:
+    """Return hooks the base class is missing, sourced from a module sibling.
+
+    These hooks are ``@classmethod``s that read only from ``vllm_config``, so a
+    version bound to a sibling class works unchanged on the wrapper.
+
+    Only borrow from a *concrete* implementation: the ``IsHybrid`` Protocol
+    (imported into the module namespace, so it precedes the concrete model
+    classes in ``vars(mod)`` insertion order) declares ``...``-bodied stubs for
+    some of these hooks. Borrowing such a stub yields a method that silently
+    returns ``None`` -- e.g. ``get_mamba_state_shape_from_config`` would return
+    ``None`` while ``get_mamba_state_dtype_from_config`` (absent from the
+    Protocol) correctly resolved to the real class, leaving ``MambaSpec`` to
+    crash on ``zip(None, dtypes)``. Skipping ``Protocol`` siblings makes both
+    hooks resolve to the same concrete sibling (e.g.
+    ``Qwen3_5ForConditionalGeneration``).
+    """
+    borrowed: dict = {}
+    for hook in _HYBRID_STATE_HOOKS:
+        if hasattr(base_cls, hook):
+            continue
+        for sibling in vars(mod).values():
+            if (
+                isinstance(sibling, type)
+                and not getattr(sibling, "_is_protocol", False)
+                and hook in sibling.__dict__
+            ):
+                borrowed[hook] = getattr(sibling, hook)
+                break
+    return borrowed
+
+
 def _make_wrapper_cls(arch_name: str, arch_info: ArchInfo) -> type:
     """Create ``AnyModel{arch_name}(AnyModel, BaseModelCls)`` wrapper."""
     base_mod_path = arch_info.base_model_module or arch_info.decoder_layer_module
     mod = importlib.import_module(base_mod_path, package=__package__)
     base_cls = getattr(mod, arch_name)
+    namespace = {"_anymodel_arch_info": arch_info, "has_noops": True}
+    namespace.update(_borrow_hybrid_state_hooks(mod, base_cls))
     return type(
         f"AnyModel{arch_name}",
         (AnyModel, base_cls),
-        {"_anymodel_arch_info": arch_info, "has_noops": True},
+        namespace,
     )
+
+
+def resolve_base_model_cls(hf_config) -> type | None:
+    """Resolve the concrete base model class an AnyModel config wraps.
+
+    Mirrors the resolution used to build the wrapper (``base_architecture`` +
+    ``anymodel_arch_info.base_model_module``) but returns only the base class,
+    e.g. ``Qwen3_5ForCausalLM``. Returns ``None`` if it cannot be resolved.
+
+    This lets callers inspect the base model's capabilities (runner type,
+    generation support, ...) directly when ``base_architecture`` is not present
+    in vLLM's model registry -- as is the case for text-only LMs whose only
+    registered architecture is the multimodal ``*ForConditionalGeneration``.
+    """
+    try:
+        arch_name, arch_info, _ = AnyModel._resolve_arch(hf_config)
+        base_mod_path = arch_info.base_model_module or arch_info.decoder_layer_module
+        mod = importlib.import_module(base_mod_path, package=__package__)
+        return getattr(mod, arch_name)
+    except Exception:
+        return None
 
 
 def _expand_noop_prefixes_for_mapper(
@@ -600,14 +721,12 @@ class AnyModel(nn.Module, HasNoOps):
         arch_info = type(self)._anymodel_arch_info
         if arch_info is not None:
             config = self.config
-            layer_base_config = (
-                getattr(config, arch_info.layer_hf_config)
-                if arch_info.layer_hf_config
-                else config
-            )
+            layer_base_config = _resolve_layer_base_config(config, arch_info)
             per_layer_config = getattr(layer_base_config, "per_layer_config", None)
             if per_layer_config:
-                noop_prefixes = _collect_noop_prefixes(per_layer_config, arch_info)
+                noop_prefixes = _collect_noop_prefixes(
+                    per_layer_config, arch_info, self
+                )
                 if noop_prefixes:
                     noop_prefixes = _expand_noop_prefixes_for_mapper(
                         noop_prefixes, type(self)

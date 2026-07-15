@@ -3,6 +3,7 @@
 """Inference-only Qwen3-Next/Qwen3.5 model."""
 
 import functools
+import os
 from typing import Literal
 
 import torch
@@ -149,6 +150,8 @@ def _is_libs_cu13_install_intact() -> bool:
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
+    head_k_dim: int | None = None,
+    head_v_dim: int | None = None,
 ) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
     """Resolve GDN prefill backend.
 
@@ -156,7 +159,7 @@ def _resolve_gdn_prefill_backend(
     * ``requested in ["flashinfer", "auto"]``;
     * ``platform == cuda``;
     * one of the following:
-      - Hopper (SM90) — no further constraints;
+      - Hopper (SM90) with 128-dimensional key/value heads;
       - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``,
         and an intact ``nvidia-cutlass-dsl-libs-cu13`` install on disk
         (see :func:`_is_libs_cu13_install_intact`).
@@ -176,18 +179,28 @@ def _resolve_gdn_prefill_backend(
     if not current_platform.is_cuda():
         return backend, "triton"
 
-    head_k_dim = getattr(
-        vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
-    )
+    if head_k_dim is None:
+        head_k_dim = getattr(
+            vllm_config.model_config.hf_text_config, "linear_key_head_dim", None
+        )
+    if head_v_dim is None:
+        head_v_dim = getattr(
+            vllm_config.model_config.hf_text_config, "linear_value_head_dim", None
+        )
+    # FlashInfer's current GDN state/output layout is only safe for the
+    # production Qwen shape. Smaller pruned head dimensions can either make
+    # the state shapes disagree or corrupt the following normalization launch.
+    flashinfer_shape_supported = head_k_dim == head_v_dim == 128
 
     supports_flashinfer = False
     supports_cutedsl = False
 
     if current_platform.is_device_capability(90):
-        supports_flashinfer = True
+        supports_flashinfer = flashinfer_shape_supported
     elif (
         current_platform.is_device_capability_family(100)
         and head_k_dim == 128
+        and flashinfer_shape_supported
         and current_platform.get_cuda_runtime_major() >= 13
     ):
         supports_flashinfer = _is_libs_cu13_install_intact()
@@ -289,10 +302,14 @@ def fi_chunk_gated_delta_rule(
 
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
-    def __init__(self) -> None:
+    def __init__(self, head_k_dim: int | None = None, head_v_dim: int | None = None) -> None:
         super().__init__()
         vllm_config = get_current_vllm_config()
-        backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
+        backend, active_backend = _resolve_gdn_prefill_backend(
+            vllm_config,
+            head_k_dim=head_k_dim,
+            head_v_dim=head_v_dim,
+        )
         self.gdn_prefill_backend = active_backend
 
         if backend in ("flashinfer", "cutedsl") and active_backend != backend:
@@ -551,7 +568,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefix=f"{prefix}.out_proj",
         )
 
-        self.chunk_gated_delta_rule = ChunkGatedDeltaRule()
+        self.chunk_gated_delta_rule = ChunkGatedDeltaRule(
+            head_k_dim=self.head_k_dim,
+            head_v_dim=self.head_v_dim,
+        )
         self.gdn_prefill_backend = self.chunk_gated_delta_rule.gdn_prefill_backend
         self._prefill_kernels_warmed_up = False
         self.enable_packed_recurrent_decode = (
@@ -1162,6 +1182,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 use_qk_l2norm_in_kernel=False,
             )
         except Exception:
+            if os.environ.get("VLLM_GDN_WARMUP_RERAISE") == "1":
+                raise
             logger.warning(
                 "GDN prefill kernel warmup (T=%d) failed for "
                 "layer %s. First inference may OOM due to "

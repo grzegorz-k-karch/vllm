@@ -206,8 +206,15 @@ def fused_post_conv_prep(
         return q, k, v, g, beta
 
     # ---- Kernel config ----
-    BK = triton.next_power_of_2(K)
-    BV = triton.next_power_of_2(V)
+    # Both sides of the Triton ``if i_head < H`` must have identical static
+    # tensor types.  Using independent powers of two makes ``mask_2d`` e.g.
+    # [BLOCK_T, 64] in the Q/K branch and [BLOCK_T, 128] in the V branch when
+    # heterogeneous GDN key/value dimensions are benchmarked, which Triton
+    # rejects while joining the branches.  A shared tile retains the existing
+    # K/V masks and supports every legal unequal-dimension pair.
+    shared_feature_block = triton.next_power_of_2(max(K, V))
+    BK = shared_feature_block
+    BV = shared_feature_block
     BLOCK_T = 16  # tokens per block
 
     # Single kernel: blocks [0,H) do Q/K, blocks [H, H+HV) do V+gating

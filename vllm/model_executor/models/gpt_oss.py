@@ -69,6 +69,36 @@ from .utils import (
 )
 
 
+def _get_layer_sliding_window(config, layer_idx: int) -> int | None:
+    """Resolve the explicit layer type, retaining parity only for legacy configs."""
+
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is not None and layer_idx < len(layer_types):
+        return (
+            config.sliding_window
+            if layer_types[layer_idx] == "sliding_attention"
+            else None
+        )
+    return config.sliding_window if layer_idx % 2 == 0 else None
+
+
+def _load_attention_sinks(
+    params_dict: dict[str, torch.nn.Parameter],
+    name: str,
+    weight: torch.Tensor,
+) -> None:
+    """Load sinks using the rebuilt layer's local head count.
+
+    AnyModel can vary attention heads per layer, so the global config cannot
+    determine this slice. The instantiated parameter already has the exact
+    local shape for the current tensor-parallel rank.
+    """
+    param = params_dict[name]
+    local_heads = param.data.shape[0]
+    local_start = get_tensor_model_parallel_rank() * local_heads
+    param.data.copy_(weight.narrow(0, local_start, local_heads))
+
+
 class OAIAttention(nn.Module):
     def __init__(
         self,
@@ -133,8 +163,7 @@ class OAIAttention(nn.Module):
         self.num_local_attention_heads = config.num_attention_heads // tp_size
         self.num_local_key_value_heads = config.num_key_value_heads // tp_size
 
-        # Only apply sliding window to every other layer
-        sliding_window = config.sliding_window if self.layer_idx % 2 == 0 else None
+        sliding_window = _get_layer_sliding_window(config, self.layer_idx)
         self.attn = Attention(
             self.num_local_attention_heads,
             self.head_dim,
@@ -510,9 +539,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 continue
             elif "sinks" in name:
                 # Handle attention sinks (distributed across ranks)
-                param = params_dict[name]
-                narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                _load_attention_sinks(params_dict, name, weight)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -861,9 +888,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
             elif "sinks" in name:
                 # Handle attention sinks (distributed across ranks)
-                param = params_dict[name]
-                narrow_weight = loaded_weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                _load_attention_sinks(params_dict, name, loaded_weight)
                 loaded_params.add(name)
                 continue
 
@@ -971,7 +996,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
         tp_rank_start = tp_rank * per_rank_intermediate_size
         tp_rank_end = min((tp_rank + 1) * per_rank_intermediate_size, intermediate_size)
 
-        for name, weight in weights:
+        for name, weight in remap_moe_expert_weights(weights, params_dict):
             # Skip layers on other devices.
             if is_pp_missing_parameter(name, self):
                 continue
@@ -1028,9 +1053,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 continue
             elif "sinks" in name:
                 # Handle attention sinks (distributed across ranks)
-                param = params_dict[name]
-                narrow_weight = weight.narrow(0, head_start, heads_per_rank)
-                param.data.copy_(narrow_weight)
+                _load_attention_sinks(params_dict, name, weight)
                 loaded_params.add(name)
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:

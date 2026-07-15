@@ -54,8 +54,32 @@ class AnyModelConfig(VerifyAndUpdateConfig):
         base_arch = getattr(hf_config, "base_architecture", None)
         if base_arch:
             base_info = model_config.registry._try_inspect_model_cls(base_arch)
+            if base_info is None:
+                # The base architecture may not be in vLLM's model registry
+                # (e.g. a text-only LM whose only registered architecture is
+                # the multimodal ``*ForConditionalGeneration``). Resolve the
+                # class the same way AnyModel does for instantiation and
+                # inspect it directly so runner detection still works.
+                from vllm.model_executor.models.anymodel import (
+                    resolve_base_model_cls,
+                )
+                from vllm.model_executor.models.registry import _ModelInfo
+
+                base_cls = resolve_base_model_cls(hf_config)
+                if base_cls is not None:
+                    base_info = _ModelInfo.from_model_cls(base_cls)
             if base_info is not None:
-                model_config._model_info = replace(base_info, has_noops=True)
+                # The text-only base arch (e.g. Qwen3_5ForCausalLM) may omit
+                # the ``IsHybrid`` marker that its multimodal / *Next siblings
+                # declare, even though the checkpoint mixes ``linear_attention``
+                # (mamba) and ``full_attention`` layers. Detect hybridness from
+                # the config so downstream mamba setup (e.g. mamba_block_size in
+                # Platform._align_hybrid_block_size) runs.
+                layer_types = getattr(text_config, "layer_types", None) or []
+                is_hybrid = base_info.is_hybrid or ("linear_attention" in layer_types)
+                model_config._model_info = replace(
+                    base_info, has_noops=True, is_hybrid=is_hybrid
+                )
 
                 # "AnyModel" suffix auto-resolves to pooling/embed; fix that
                 # when the base arch is a text-generation model.
