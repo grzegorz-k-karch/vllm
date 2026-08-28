@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from typing import final
 
 import torch
@@ -487,8 +488,10 @@ class AnyModelArchConfigConvertor(ModelArchConfigConvertorBase):
 
     @classmethod
     def _iter_entries(cls, per_layer_config):
-        """Yield per-layer entries (values), tolerating int/str dict keys."""
-        return list(per_layer_config.values())
+        """Yield per-layer entries from dicts or HF sequence views."""
+        if isinstance(per_layer_config, Mapping):
+            return list(per_layer_config.values())
+        return list(per_layer_config)
 
     def get_total_num_kv_heads(self) -> int:
         # Return the max KV head count across non-skipped attention layers

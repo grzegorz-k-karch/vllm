@@ -22,6 +22,7 @@ from vllm.model_executor.models.anymodel import (
     _arch_info_from_config,
     _create_layer_config,
     _has_overrides,
+    _iter_layer_overrides,
     _resolve_layer_class,
     _unregister_layer,
 )
@@ -376,6 +377,31 @@ class TestHasOverrides:
     )
     def test_has_overrides(self, entry, expected):
         assert _has_overrides(entry) is expected
+
+
+class TestLayerOverrideIteration:
+    def test_dict_overrides_sort_numerically(self):
+        per_layer_config = {
+            "10": _block(kv_heads=2),
+            "2": _block(attn_no_op=True),
+        }
+
+        assert list(_iter_layer_overrides(per_layer_config)) == [
+            (2, per_layer_config["2"]),
+            (10, per_layer_config["10"]),
+        ]
+
+    def test_transformers_sequence_view_uses_sparse_overrides(self):
+        overrides = {
+            10: _block(kv_heads=2),
+            2: _block(attn_no_op=True),
+        }
+        view = _ns(_config=_ns(_heterogeneity_spec=_ns(per_layer_overrides=overrides)))
+
+        assert list(_iter_layer_overrides(view)) == [
+            (2, overrides[2]),
+            (10, overrides[10]),
+        ]
 
 
 class TestUnregisterLayer:

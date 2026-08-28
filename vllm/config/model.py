@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import InitVar, field
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Literal, cast, get_args
@@ -1361,12 +1361,16 @@ class ModelConfig:
                 return getattr(entry, "skip", None) or ()
 
             def _lookup(layer_idx):
+                if per_layer_config is None:
+                    return {}
                 # JSON keys are strings; Python construction may use ints.
-                return (
-                    per_layer_config.get(layer_idx)
-                    or per_layer_config.get(str(layer_idx))
-                    or {}
-                )
+                if isinstance(per_layer_config, Mapping):
+                    return (
+                        per_layer_config.get(layer_idx)
+                        or per_layer_config.get(str(layer_idx))
+                        or {}
+                    )
+                return per_layer_config[layer_idx]
 
             return sum(
                 "attention" not in _entry_skip(_lookup(layer_idx))

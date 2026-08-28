@@ -28,7 +28,7 @@ import functools
 import importlib
 import importlib.util
 import inspect
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from typing import ClassVar
@@ -107,13 +107,31 @@ def _layer_skip_set(entry) -> set[str]:
     return set(skip)
 
 
+def _raw_per_layer_overrides(per_layer_config):
+    """Return sparse layer overrides from HF's dict or sequence view."""
+    if per_layer_config is None:
+        return None
+    if isinstance(per_layer_config, Mapping):
+        return per_layer_config
+
+    # Transformers v5 exposes config.per_layer_config as a Sequence of
+    # resolved per-layer configs; the original sparse mapping is kept on the
+    # parent config's private heterogeneity spec.
+    parent_config = getattr(per_layer_config, "_config", None)
+    heterogeneity_spec = getattr(parent_config, "_heterogeneity_spec", None)
+    return getattr(heterogeneity_spec, "per_layer_overrides", None)
+
+
 def _iter_layer_overrides(per_layer_config):
     """Yield ``(layer_idx, layer_overrides)`` from a sparse per_layer_config.
 
     JSON-loaded configs have string keys; Python-constructed ones may use
     ints.  Coerces to int and yields in ascending layer-index order.
     """
-    for key, entry in sorted(per_layer_config.items(), key=lambda kv: int(kv[0])):
+    raw_overrides = _raw_per_layer_overrides(per_layer_config)
+    if raw_overrides is None:
+        return
+    for key, entry in sorted(raw_overrides.items(), key=lambda kv: int(kv[0])):
         yield int(key), entry
 
 
@@ -354,7 +372,9 @@ def _collect_noop_prefixes(
         ffn_noop = _SKIP_GROUP_MLP in skip
         layer = layers[idx] if 0 <= idx < len(layers) else None
         attn_module = (
-            _attention_module_name(layer, info) if layer is not None else info.attn_module
+            _attention_module_name(layer, info)
+            if layer is not None
+            else info.attn_module
         )
         shared_module = attn_module == info.ffn_module
 

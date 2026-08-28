@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -12,6 +13,27 @@ if TYPE_CHECKING:
 
 
 logger = init_logger(__name__)
+
+
+def _get_sparse_per_layer_config(text_config: "PretrainedConfig"):
+    heterogeneity_spec = getattr(text_config, "_heterogeneity_spec", None)
+    if heterogeneity_spec is not None:
+        return getattr(heterogeneity_spec, "per_layer_overrides", None)
+    return getattr(text_config, "per_layer_config", None)
+
+
+def _iter_per_layer_keys(per_layer_config):
+    if isinstance(per_layer_config, Mapping):
+        yield from per_layer_config
+    else:
+        yield from range(len(per_layer_config))
+
+
+def _iter_per_layer_values(per_layer_config):
+    if isinstance(per_layer_config, Mapping):
+        yield from per_layer_config.values()
+    else:
+        yield from per_layer_config
 
 
 class VerifyAndUpdateConfig:
@@ -34,10 +56,10 @@ class AnyModelConfig(VerifyAndUpdateConfig):
         # For VL models per_layer_config lives on text_config, not hf_config.
         text_config = hf_config.get_text_config()
 
-        per_layer_config = getattr(text_config, "per_layer_config", None)
+        per_layer_config = _get_sparse_per_layer_config(text_config)
         if per_layer_config:
             n_layers = text_config.num_hidden_layers
-            for key in per_layer_config:
+            for key in _iter_per_layer_keys(per_layer_config):
                 try:
                     idx = int(key)
                 except (TypeError, ValueError) as exc:
@@ -95,14 +117,14 @@ class AnyModelConfig(VerifyAndUpdateConfig):
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         """Apply AnyModel safety settings, then delegate to the base hook."""
         text_config = vllm_config.model_config.hf_config.get_text_config()
-        per_layer_config = getattr(text_config, "per_layer_config", None) or {}
+        per_layer_config = _get_sparse_per_layer_config(text_config) or {}
 
         def _skip(entry):
             if isinstance(entry, dict):
                 return entry.get("skip") or ()
             return getattr(entry, "skip", None) or ()
 
-        if any(_skip(entry) for entry in per_layer_config.values()):
+        if any(_skip(entry) for entry in _iter_per_layer_values(per_layer_config)):
             # CUDA graph capture currently assumes the base architecture's full
             # module topology. AnyModel can replace an attention/GDN or MLP with
             # a no-op after base-model construction; replaying the captured base
